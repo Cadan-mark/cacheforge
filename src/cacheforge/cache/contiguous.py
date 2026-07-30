@@ -7,7 +7,11 @@ from torch import Tensor
 
 
 class ContiguousKVCache:
-    """Preallocated K/V cache with layout [batch, num_kv_heads, max_seq_len, head_dim]."""
+    """Preallocated K/V cache with layout [batch, num_kv_heads, max_seq_len, head_dim].
+
+    这里预先分配整块 K/V 存储，而不是每生成一个 token 就做拼接，
+    目的是让 Decode 路径始终以“按位置写入、按有效长度读取”的方式工作。
+    """
 
     def __init__(
         self,
@@ -34,13 +38,16 @@ class ContiguousKVCache:
         self.head_dim = head_dim
         self.dtype = dtype
         self.device = torch.device(device)
+        # cache 只保存紧凑的 KV heads，不保存为 GQA 计算临时扩展出的 attention heads。
         self.key = torch.zeros(
             batch_size, num_kv_heads, max_seq_len, head_dim, dtype=dtype, device=device
         )
         self.value = torch.zeros_like(self.key)
+        # lengths[slot] 表示该 batch slot 已经写入了多少个连续 token。
         self.lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
 
     def allocated_bytes(self) -> int:
+        # 返回 K 和 V 两块底层 storage 的总字节数，对应 README 里的单层缓存公式。
         return (self.key.untyped_storage().nbytes() + self.value.untyped_storage().nbytes())
 
     def reset(self, batch_indices: int | Sequence[int] | Tensor | None = None) -> None:
@@ -84,6 +91,7 @@ class ContiguousKVCache:
             if end > self.max_seq_len:
                 raise IndexError("write exceeds max_seq_len")
             current_length = int(self.lengths[slot].item())
+            # Milestone 1 的 contiguous cache 不允许留下未写入空洞，否则有效区间就不再是连续前缀。
             if start > current_length:
                 raise ValueError("writes may not leave unwritten gaps in the cache")
             self.key[slot, :, start:end, :] = key[row]
@@ -103,6 +111,7 @@ class ContiguousKVCache:
         indices = self._normalize_batch_indices(batch_indices)
         starts = self._normalize_start_positions(positions, indices.numel())
         for row, slot in enumerate(indices.tolist()):
+            # append 的语义是“把当前 token 接到序列尾部”，因此写入位置必须等于当前长度。
             if int(starts[row].item()) != int(self.lengths[slot].item()):
                 raise ValueError("append position must equal the current sequence length")
         self.write(batch_indices=indices, start_positions=starts, key=key, value=value)

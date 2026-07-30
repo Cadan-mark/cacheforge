@@ -15,6 +15,7 @@ class LlamaSelfAttention(nn.Module):
         super().__init__()
         self.config = config
         self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        # GQA 中 Q 保留全部 attention heads，而 K/V 只保留更少的 KV heads 来节省缓存内存。
         self.k_proj = nn.Linear(
             config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False
         )
@@ -25,6 +26,7 @@ class LlamaSelfAttention(nn.Module):
         self.rotary = RotaryEmbedding(config.head_dim, base=config.rope_theta)
 
     def forward(self, hidden_states: Tensor, positions: Tensor | None = None) -> Tensor:
+        # `forward()` 是不使用 cache 的完整上下文路径，适合作为 correctness 参考。
         batch_size, seq_len, _ = hidden_states.shape
         positions = self._normalize_positions(positions, batch_size, seq_len, hidden_states.device)
         query, key, value = self._project(hidden_states, positions)
@@ -44,6 +46,7 @@ class LlamaSelfAttention(nn.Module):
         positions: Tensor | None = None,
         batch_indices: Tensor | None = None,
     ) -> Tensor:
+        # `prefill()` 处理一段连续 prompt：既返回 prompt 输出，也把这段 K/V 写入 cache。
         batch_size, seq_len, _ = hidden_states.shape
         positions = self._normalize_positions(positions, batch_size, seq_len, hidden_states.device)
         self._validate_contiguous_positions(positions)
@@ -71,6 +74,8 @@ class LlamaSelfAttention(nn.Module):
         positions: Tensor,
         batch_indices: Tensor | None = None,
     ) -> Tensor:
+        # `decode()` 只处理单个新 token，并在读取历史之前先把当前 token append 到 cache，
+        # 这样当前 token 就能像 full-context 路径一样同时看到“历史 + 自己”。
         batch_size, seq_len, _ = hidden_states.shape
         if seq_len != 1:
             raise ValueError("decode expects a single token per batch")
@@ -95,6 +100,8 @@ class LlamaSelfAttention(nn.Module):
 
     def _project(self, hidden_states: Tensor, positions: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
+        # 先在 [batch, seq_len, hidden] 上投影，再 reshape/transpose 到 attention 常用的
+        # [batch, heads, seq_len, head_dim] 布局。
         query = self.q_proj(hidden_states).view(
             batch_size, seq_len, self.config.num_attention_heads, self.config.head_dim
         )
@@ -104,6 +111,7 @@ class LlamaSelfAttention(nn.Module):
         value = self.v_proj(hidden_states).view(
             batch_size, seq_len, self.config.num_key_value_heads, self.config.head_dim
         )
+        # RoPE 需要 token 的绝对位置；Decode 时若把当前位置错误重置为 0，会破坏缓存路径等价性。
         query = self.rotary(query.transpose(1, 2), positions)
         key = self.rotary(key.transpose(1, 2), positions)
         value = value.transpose(1, 2)
@@ -119,10 +127,12 @@ class LlamaSelfAttention(nn.Module):
         key_positions: Tensor,
         key_lengths: Tensor | None = None,
     ) -> Tensor:
+        # KV 只在参与 attention 计算时临时扩展到 query heads；cache 里仍保持紧凑存储。
         expanded_key = self._expand_kv(key)
         expanded_value = self._expand_kv(value)
         scale = 1.0 / math.sqrt(self.config.head_dim)
         scores = torch.matmul(query, expanded_key.transpose(-1, -2)) * scale
+        # causal mask 负责阻止 query 看到未来位置；decode 时还会额外屏蔽掉尚未写入的 cache 尾部。
         mask = self._build_attention_mask(query_positions, key_positions, key_lengths, query.device)
         scores = scores.masked_fill(~mask.unsqueeze(1), torch.finfo(scores.dtype).min)
         probs = torch.softmax(scores, dim=-1)
@@ -131,6 +141,7 @@ class LlamaSelfAttention(nn.Module):
     def _expand_kv(self, tensor: Tensor) -> Tensor:
         if self.config.num_key_value_groups == 1:
             return tensor
+        # 这里只扩展计算视图，不改变 cache 的物理布局，否则会抵消 GQA 的内存收益。
         return tensor.repeat_interleave(self.config.num_key_value_groups, dim=1)
 
     def _merge_heads(self, tensor: Tensor) -> Tensor:
@@ -154,6 +165,7 @@ class LlamaSelfAttention(nn.Module):
         causal_mask = query_positions.unsqueeze(-1) >= key_positions.unsqueeze(-2)
         if key_lengths is None:
             return causal_mask
+        # Decode 会从预分配 cache 中切出一个前缀视图；key_lengths 用来屏蔽尚未写入的位置。
         valid_keys = key_positions < key_lengths.to(device=device).unsqueeze(-1)
         return causal_mask & valid_keys.unsqueeze(1)
 
